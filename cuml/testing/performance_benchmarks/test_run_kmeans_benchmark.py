@@ -10,8 +10,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 SCRIPT_PATH = Path(__file__).with_name("run_kmeans_benchmark.py")
 SPEC = importlib.util.spec_from_file_location("cuml_kmeans_benchmark", SCRIPT_PATH)
@@ -177,32 +175,21 @@ class NumpyDatasetTest(unittest.TestCase):
 @unittest.skipIf(da is None, "Dask is not installed")
 class DaskInputGraphTest(unittest.TestCase):
     def test_worker_pinned_blocks_are_concrete_tasks(self) -> None:
-        futures = [
-            SimpleNamespace(key="future-0", status="finished"),
-            SimpleNamespace(key="future-1", status="finished"),
+        tasks = [
+            (benchmark._path_preflight, "first"),
+            (benchmark._path_preflight, "second"),
         ]
         specs = benchmark.partition_specs(10, ["worker-0", "worker-1"])
-
-        class FakeClient:
-            @staticmethod
-            def who_has(items):
-                return {
-                    items[0].key: ("worker-0",),
-                    items[1].key: ("worker-1",),
-                }
-
-        with patch("distributed.wait"):
-            array = benchmark._array_from_futures(
-                client=FakeClient(),
-                futures=futures,
-                specs=specs,
-                n_features=3,
-            )
+        array = benchmark._worker_pinned_array(
+            tasks=tasks,
+            specs=specs,
+            n_features=3,
+        )
 
         self.assertEqual(array.chunks, ((5, 5), (3,)))
         layer = array.dask.layers[array.name]
         for key, task in layer.items():
-            self.assertIs(task[0], benchmark._identity_partition)
+            self.assertIs(task[0], benchmark._path_preflight)
             expected_worker = specs[key[1]].worker
             self.assertEqual(layer.annotations["workers"](key), expected_worker)
         self.assertFalse(layer.annotations["allow_other_workers"])

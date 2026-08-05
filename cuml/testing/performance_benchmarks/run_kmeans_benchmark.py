@@ -223,42 +223,25 @@ def _make_centers(n_clusters: int, n_features: int, seed: int) -> Any:
     )
 
 
-def _identity_partition(partition: Any) -> Any:
-    """Give a worker-local partition a concrete Dask array block key."""
-    return partition
-
-
-def _array_from_futures(*, client: Any, futures: list[Any], specs: list[PartitionSpec], n_features: int) -> Any:
+def _worker_pinned_array(*, tasks: list[Any], specs: list[PartitionSpec], n_features: int) -> Any:
+    """Build an array whose concrete block tasks have hard worker restrictions."""
     import numpy as np
     from dask.array import Array
     from dask.base import tokenize
     from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
-    from distributed import wait
 
-    wait(futures)
-    for future in futures:
-        if future.status == "error":
-            raise future.exception()
-    locations = client.who_has(futures)
-    for future, spec in zip(futures, specs):
-        actual_workers = set(locations.get(future.key, ()))
-        if actual_workers != {spec.worker}:
-            raise RuntimeError(f"partition {spec.index} expected on {spec.worker}, found on {sorted(actual_workers)}")
-        print(
-            f"input partition {spec.index}: rows=[{spec.start_row}, {spec.start_row + spec.rows}) worker={spec.worker}",
-            flush=True,
-        )
+    if len(tasks) != len(specs):
+        raise ValueError("one input task is required per partition")
 
-    name = f"worker-pinned-kmeans-input-{tokenize([future.key for future in futures])}"
+    name = f"worker-pinned-kmeans-input-{tokenize(tasks, specs, n_features)}"
     keys = [(name, spec.index, 0) for spec in specs]
     worker_by_key = {key: spec.worker for key, spec in zip(keys, specs)}
 
     def worker_for_key(key: Any) -> str:
         return worker_by_key[key]
 
-    tasks = {key: (_identity_partition, future) for key, future in zip(keys, futures)}
     layer = MaterializedLayer(
-        tasks,
+        dict(zip(keys, tasks)),
         annotations={
             "workers": worker_for_key,
             "allow_other_workers": False,
@@ -274,6 +257,36 @@ def _array_from_futures(*, client: Any, futures: list[Any], specs: list[Partitio
     )
 
 
+def _persist_worker_pinned_array(*, client: Any, array: Any, specs: list[PartitionSpec]) -> Any:
+    """Materialize final array blocks and verify their exact worker locations."""
+    from distributed import wait
+
+    persisted = client.persist(array)
+    futures = client.futures_of(persisted)
+    wait(futures)
+    future_by_key = {future.key: future for future in futures}
+    locations = client.who_has(futures)
+
+    for spec in specs:
+        key = (persisted.name, spec.index, 0)
+        future = future_by_key.get(key)
+        if future is None:
+            raise RuntimeError(f"missing persisted future for partition {spec.index}: {key}")
+        if future.status == "error":
+            raise future.exception()
+        if future.status != "finished":
+            raise RuntimeError(f"partition {spec.index} has unexpected status {future.status}")
+        actual_workers = set(locations.get(key, ()))
+        if actual_workers != {spec.worker}:
+            raise RuntimeError(f"partition {spec.index} expected on {spec.worker}, found on {sorted(actual_workers)}")
+        print(
+            f"input partition {spec.index}: rows=[{spec.start_row}, {spec.start_row + spec.rows}) worker={spec.worker}",
+            flush=True,
+        )
+
+    return persisted
+
+
 def build_generated_input_array(
     *,
     client: Any,
@@ -286,28 +299,28 @@ def build_generated_input_array(
 ) -> tuple[Any, list[PartitionSpec]]:
     specs = partition_specs(n_samples, workers)
     centers = _make_centers(n_clusters, n_features, seed)
-    futures = []
-    for spec in specs:
-        futures.append(
-            client.submit(
-                generate_blob_partition,
-                spec.start_row,
-                spec.rows,
-                centers,
-                cluster_std,
-                seed,
-                workers=[spec.worker],
-                allow_other_workers=False,
-                pure=False,
-            )
+    tasks = [
+        (
+            generate_blob_partition,
+            spec.start_row,
+            spec.rows,
+            centers,
+            cluster_std,
+            seed,
         )
-    array = _array_from_futures(
-        client=client,
-        futures=futures,
+        for spec in specs
+    ]
+    array = _worker_pinned_array(
+        tasks=tasks,
         specs=specs,
         n_features=n_features,
     )
-    return array, specs
+    persisted = _persist_worker_pinned_array(
+        client=client,
+        array=array,
+        specs=specs,
+    )
+    return persisted, specs
 
 
 def build_fbin_input_array(
@@ -326,28 +339,28 @@ def build_fbin_input_array(
         raise RuntimeError(f"input fbin is not readable on every worker: {details}")
 
     specs = partition_specs(n_samples, workers)
-    futures = []
-    for spec in specs:
-        futures.append(
-            client.submit(
-                load_fbin_partition,
-                str(input_fbin),
-                fbin_header.header_bytes,
-                spec.start_row,
-                spec.rows,
-                n_features,
-                workers=[spec.worker],
-                allow_other_workers=False,
-                pure=False,
-            )
+    tasks = [
+        (
+            load_fbin_partition,
+            str(input_fbin),
+            fbin_header.header_bytes,
+            spec.start_row,
+            spec.rows,
+            n_features,
         )
-    array = _array_from_futures(
-        client=client,
-        futures=futures,
+        for spec in specs
+    ]
+    array = _worker_pinned_array(
+        tasks=tasks,
         specs=specs,
         n_features=n_features,
     )
-    return array, specs
+    persisted = _persist_worker_pinned_array(
+        client=client,
+        array=array,
+        specs=specs,
+    )
+    return persisted, specs
 
 
 def aggregate_times(times_ms: list[float]) -> dict[str, float]:
