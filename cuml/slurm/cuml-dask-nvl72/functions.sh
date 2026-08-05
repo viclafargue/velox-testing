@@ -46,6 +46,10 @@ set -euo pipefail
 set -a
 source /var/worker_env_file
 set +a
+export HOME=/tmp
+export XDG_CACHE_HOME=/tmp/.cache
+export CUPY_CACHE_DIR=/tmp/cupy-kernel-cache
+mkdir -p "\${XDG_CACHE_HOME}" "\${CUPY_CACHE_DIR}"
 exec dask scheduler \
   --host ${COORD_IP:-0.0.0.0} \
   --port ${DASK_SCHEDULER_PORT} \
