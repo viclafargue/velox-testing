@@ -223,8 +223,16 @@ def _make_centers(n_clusters: int, n_features: int, seed: int) -> Any:
     )
 
 
+def _identity_partition(partition: Any) -> Any:
+    """Give a worker-local partition a concrete Dask array block key."""
+    return partition
+
+
 def _array_from_futures(*, client: Any, futures: list[Any], specs: list[PartitionSpec], n_features: int) -> Any:
-    import dask.array as da
+    import numpy as np
+    from dask.array import Array
+    from dask.base import tokenize
+    from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
     from distributed import wait
 
     wait(futures)
@@ -236,19 +244,34 @@ def _array_from_futures(*, client: Any, futures: list[Any], specs: list[Partitio
         actual_workers = set(locations.get(future.key, ()))
         if actual_workers != {spec.worker}:
             raise RuntimeError(f"partition {spec.index} expected on {spec.worker}, found on {sorted(actual_workers)}")
-    parts = [
-        da.from_delayed(
-            future,
-            shape=(spec.rows, n_features),
-            dtype="float32",
-            meta=None,
+        print(
+            f"input partition {spec.index}: rows=[{spec.start_row}, {spec.start_row + spec.rows}) worker={spec.worker}",
+            flush=True,
         )
-        for future, spec in zip(futures, specs)
-    ]
-    # Keep the computed futures in the graph. cuML persists this collection in
-    # DistributedDataHandler; persisting here can leave alias-only block keys
-    # without a worker location.
-    return da.concatenate(parts, axis=0)
+
+    name = f"worker-pinned-kmeans-input-{tokenize([future.key for future in futures])}"
+    keys = [(name, spec.index, 0) for spec in specs]
+    worker_by_key = {key: spec.worker for key, spec in zip(keys, specs)}
+
+    def worker_for_key(key: Any) -> str:
+        return worker_by_key[key]
+
+    tasks = {key: (_identity_partition, future) for key, future in zip(keys, futures)}
+    layer = MaterializedLayer(
+        tasks,
+        annotations={
+            "workers": worker_for_key,
+            "allow_other_workers": False,
+        },
+    )
+    graph = HighLevelGraph({name: layer}, {name: set()})
+    return Array(
+        graph,
+        name,
+        chunks=(tuple(spec.rows for spec in specs), (n_features,)),
+        dtype=np.float32,
+        meta=np.empty((0, n_features), dtype=np.float32),
+    )
 
 
 def build_generated_input_array(
