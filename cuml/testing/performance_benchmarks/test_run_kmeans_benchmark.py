@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 SCRIPT_PATH = Path(__file__).with_name("run_kmeans_benchmark.py")
 SPEC = importlib.util.spec_from_file_location("cuml_kmeans_benchmark", SCRIPT_PATH)
@@ -174,25 +176,41 @@ class NumpyDatasetTest(unittest.TestCase):
 
 @unittest.skipIf(da is None, "Dask is not installed")
 class DaskInputGraphTest(unittest.TestCase):
-    def test_worker_pinned_blocks_are_concrete_tasks(self) -> None:
+    def test_worker_pinned_futures_use_final_array_keys(self) -> None:
         tasks = [
             (benchmark._path_preflight, "first"),
             (benchmark._path_preflight, "second"),
         ]
         specs = benchmark.partition_specs(10, ["worker-0", "worker-1"])
-        array = benchmark._worker_pinned_array(
-            tasks=tasks,
-            specs=specs,
-            n_features=3,
-        )
+
+        class FakeClient:
+            def __init__(self):
+                self.submissions = []
+
+            def submit(self, function, *args, **kwargs):
+                self.submissions.append((function, args, kwargs))
+                return SimpleNamespace(key=kwargs["key"], status="finished")
+
+            def who_has(self, futures):
+                return {future.key: (spec.worker,) for future, spec in zip(futures, specs)}
+
+        client = FakeClient()
+        with patch("distributed.wait"):
+            array = benchmark._submit_worker_pinned_array(
+                client=client,
+                tasks=tasks,
+                specs=specs,
+                n_features=3,
+            )
 
         self.assertEqual(array.chunks, ((5, 5), (3,)))
         layer = array.dask.layers[array.name]
-        for key, task in layer.items():
-            self.assertIs(task[0], benchmark._path_preflight)
-            expected_worker = specs[key[1]].worker
-            self.assertEqual(layer.annotations["workers"](key), expected_worker)
-        self.assertFalse(layer.annotations["allow_other_workers"])
+        for key, future in layer.items():
+            self.assertEqual(future.key, key)
+        for submission, spec in zip(client.submissions, specs):
+            _, _, kwargs = submission
+            self.assertEqual(kwargs["workers"], [spec.worker])
+            self.assertFalse(kwargs["allow_other_workers"])
 
 
 class ResultTest(unittest.TestCase):

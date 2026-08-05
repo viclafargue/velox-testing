@@ -223,30 +223,20 @@ def _make_centers(n_clusters: int, n_features: int, seed: int) -> Any:
     )
 
 
-def _worker_pinned_array(*, tasks: list[Any], specs: list[PartitionSpec], n_features: int) -> Any:
-    """Build an array whose concrete block tasks have hard worker restrictions."""
+def _array_from_keyed_futures(*, futures: list[Any], specs: list[PartitionSpec], n_features: int, name: str) -> Any:
+    """Build an array whose block keys are the keys of computed Futures."""
     import numpy as np
     from dask.array import Array
-    from dask.base import tokenize
     from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
 
-    if len(tasks) != len(specs):
-        raise ValueError("one input task is required per partition")
-
-    name = f"worker-pinned-kmeans-input-{tokenize(tasks, specs, n_features)}"
     keys = [(name, spec.index, 0) for spec in specs]
-    worker_by_key = {key: spec.worker for key, spec in zip(keys, specs)}
+    if len(futures) != len(keys):
+        raise ValueError("one input future is required per partition")
+    for future, key in zip(futures, keys):
+        if future.key != key:
+            raise ValueError(f"future key {future.key!r} does not match array block key {key!r}")
 
-    def worker_for_key(key: Any) -> str:
-        return worker_by_key[key]
-
-    layer = MaterializedLayer(
-        dict(zip(keys, tasks)),
-        annotations={
-            "workers": worker_for_key,
-            "allow_other_workers": False,
-        },
-    )
+    layer = MaterializedLayer(dict(zip(keys, futures)))
     graph = HighLevelGraph({name: layer}, {name: set()})
     return Array(
         graph,
@@ -257,21 +247,33 @@ def _worker_pinned_array(*, tasks: list[Any], specs: list[PartitionSpec], n_feat
     )
 
 
-def _persist_worker_pinned_array(*, client: Any, array: Any, specs: list[PartitionSpec]) -> Any:
-    """Materialize final array blocks and verify their exact worker locations."""
+def _submit_worker_pinned_array(*, client: Any, tasks: list[Any], specs: list[PartitionSpec], n_features: int) -> Any:
+    """Submit final block Futures with hard placement and verify locations."""
+    from dask.base import tokenize
     from distributed import wait
 
-    persisted = client.persist(array)
-    futures = client.futures_of(persisted)
-    wait(futures)
-    future_by_key = {future.key: future for future in futures}
-    locations = client.who_has(futures)
+    if len(tasks) != len(specs):
+        raise ValueError("one input task is required per partition")
 
-    for spec in specs:
-        key = (persisted.name, spec.index, 0)
-        future = future_by_key.get(key)
-        if future is None:
-            raise RuntimeError(f"missing persisted future for partition {spec.index}: {key}")
+    name = f"worker-pinned-kmeans-input-{tokenize(tasks, specs, n_features)}"
+    keys = [(name, spec.index, 0) for spec in specs]
+    futures = []
+    for key, task, spec in zip(keys, tasks, specs):
+        function, *args = task
+        futures.append(
+            client.submit(
+                function,
+                *args,
+                key=key,
+                workers=[spec.worker],
+                allow_other_workers=False,
+                pure=False,
+            )
+        )
+
+    wait(futures)
+    locations = client.who_has(futures)
+    for key, future, spec in zip(keys, futures, specs):
         if future.status == "error":
             raise future.exception()
         if future.status != "finished":
@@ -284,7 +286,12 @@ def _persist_worker_pinned_array(*, client: Any, array: Any, specs: list[Partiti
             flush=True,
         )
 
-    return persisted
+    return _array_from_keyed_futures(
+        futures=futures,
+        specs=specs,
+        n_features=n_features,
+        name=name,
+    )
 
 
 def build_generated_input_array(
@@ -310,17 +317,13 @@ def build_generated_input_array(
         )
         for spec in specs
     ]
-    array = _worker_pinned_array(
+    array = _submit_worker_pinned_array(
+        client=client,
         tasks=tasks,
         specs=specs,
         n_features=n_features,
     )
-    persisted = _persist_worker_pinned_array(
-        client=client,
-        array=array,
-        specs=specs,
-    )
-    return persisted, specs
+    return array, specs
 
 
 def build_fbin_input_array(
@@ -350,17 +353,13 @@ def build_fbin_input_array(
         )
         for spec in specs
     ]
-    array = _worker_pinned_array(
+    array = _submit_worker_pinned_array(
+        client=client,
         tasks=tasks,
         specs=specs,
         n_features=n_features,
     )
-    persisted = _persist_worker_pinned_array(
-        client=client,
-        array=array,
-        specs=specs,
-    )
-    return persisted, specs
+    return array, specs
 
 
 def aggregate_times(times_ms: list[float]) -> dict[str, float]:
