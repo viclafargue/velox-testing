@@ -11,7 +11,9 @@ import csv
 import json
 import statistics
 import struct
+import sys
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -229,6 +231,11 @@ def _array_from_futures(*, client: Any, futures: list[Any], specs: list[Partitio
     for future in futures:
         if future.status == "error":
             raise future.exception()
+    locations = client.who_has(futures)
+    for future, spec in zip(futures, specs):
+        actual_workers = set(locations.get(future.key, ()))
+        if actual_workers != {spec.worker}:
+            raise RuntimeError(f"partition {spec.index} expected on {spec.worker}, found on {sorted(actual_workers)}")
     parts = [
         da.from_delayed(
             future,
@@ -238,9 +245,10 @@ def _array_from_futures(*, client: Any, futures: list[Any], specs: list[Partitio
         )
         for future, spec in zip(futures, specs)
     ]
-    array = client.persist(da.concatenate(parts, axis=0))
-    wait(client.futures_of(array))
-    return array
+    # Keep the computed futures in the graph. cuML persists this collection in
+    # DistributedDataHandler; persisting here can leave alias-only block keys
+    # without a worker location.
+    return da.concatenate(parts, axis=0)
 
 
 def build_generated_input_array(
@@ -532,7 +540,9 @@ def _fit_once(args: argparse.Namespace, client: Any, array: Any, phase: str, ite
             n_iter=int(model.n_iter_),
             error=None,
         )
-    except Exception as exc:
+    except Exception:
+        error = traceback.format_exc()
+        print(error, file=sys.stderr, flush=True)
         return FitRecord(
             phase=phase,
             iteration=iteration,
@@ -540,7 +550,7 @@ def _fit_once(args: argparse.Namespace, client: Any, array: Any, phase: str, ite
             status="error",
             inertia=None,
             n_iter=None,
-            error=f"{type(exc).__name__}: {exc}",
+            error=error,
         )
 
 
