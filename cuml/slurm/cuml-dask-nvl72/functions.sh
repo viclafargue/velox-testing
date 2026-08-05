@@ -1,6 +1,7 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# shellcheck disable=SC1083,SC2153
 
 function validate_environment_preconditions {
   local missing=()
@@ -18,13 +19,16 @@ function setup {
   validate_environment_preconditions \
     VT_ROOT IMAGE_DIR WORKER_IMAGE LOGS RESULT_DIR \
     DASK_SCHEDULER_ADDRESS NUM_GPUS_PER_NODE NUM_NODES TOTAL_WORKERS \
-    N_SAMPLES N_FEATURES N_CLUSTERS ITERATIONS
+    N_SAMPLES N_CLUSTERS WARMUP_RUNS REPEATS DEVICE_BUFFER_SAMPLES
 
   [[ -d "${VT_ROOT}" ]] || echo_error "VT_ROOT must be a valid directory"
 
   local worker_image_path="${IMAGE_DIR}/${WORKER_IMAGE}.sqsh"
   [[ -f "${worker_image_path}" ]] || echo_error "worker image does not exist at ${worker_image_path}"
   [[ -f "${WORKER_ENV_FILE}" ]] || echo_error "worker env file does not exist at ${WORKER_ENV_FILE}"
+  if [[ -n "${INPUT_FBIN:-}" ]]; then
+    [[ -d "${DATASET_ROOT}" ]] || echo_error "DATASET_ROOT must be a valid directory for fbin input"
+  fi
 
   mkdir -p "${LOGS}" "${RESULT_DIR}"
 }
@@ -57,6 +61,11 @@ function run_worker {
 
   local worker_image="${IMAGE_DIR}/${WORKER_IMAGE}.sqsh"
   local libnvidia_ml_host=""
+  local dataset_mount=""
+
+  if [[ -n "${INPUT_FBIN:-}" ]]; then
+    dataset_mount=",${DATASET_ROOT}:/datasets:ro"
+  fi
 
   for candidate in \
     /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1 \
@@ -77,7 +86,7 @@ function run_worker {
     --container-image="${worker_image}" \
     --container-remap-root \
     --export=ALL,NVIDIA_VISIBLE_DEVICES=all,NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    --container-mounts="${VT_ROOT}:/workspace,${WORKER_ENV_FILE}:/var/worker_env_file${driver_mounts}" \
+    --container-mounts="${VT_ROOT}:/workspace,${WORKER_ENV_FILE}:/var/worker_env_file${driver_mounts}${dataset_mount}" \
     -- bash -lc "
 set -euo pipefail
 set -a
@@ -178,35 +187,58 @@ function run_kmeans_benchmark {
   local worker_image="${IMAGE_DIR}/${WORKER_IMAGE}.sqsh"
   local script="/workspace/cuml/testing/performance_benchmarks/run_kmeans_benchmark.py"
   local result_dir="/workspace/cuml/slurm/cuml-dask-nvl72/result_dir"
+  local dataset_mount=""
+
+  if [[ -n "${INPUT_FBIN:-}" ]]; then
+    dataset_mount=",${DATASET_ROOT}:/datasets:ro"
+  fi
 
   local samples_per_gpu_arg=""
   if [[ -n "${SAMPLES_PER_GPU:-}" ]]; then
     samples_per_gpu_arg="--samples-per-gpu ${SAMPLES_PER_GPU}"
   fi
 
+  local n_features_arg=""
+  if [[ -n "${N_FEATURES:-}" ]]; then
+    n_features_arg="--n-features ${N_FEATURES}"
+  fi
+
+  local input_fbin_arg=""
+  if [[ -n "${INPUT_FBIN:-}" ]]; then
+    input_fbin_arg="--input-fbin ${INPUT_FBIN}"
+  fi
+
   srun -N1 -w "${COORD}" --ntasks=1 --overlap \
     --container-image="${worker_image}" \
     --container-remap-root \
     --export=ALL \
-    --container-mounts="${VT_ROOT}:/workspace,${WORKER_ENV_FILE}:/var/worker_env_file" \
+    --container-mounts="${VT_ROOT}:/workspace,${WORKER_ENV_FILE}:/var/worker_env_file${dataset_mount}" \
     -- bash -lc "
 set -euo pipefail
 set -a
 source /var/worker_env_file
 set +a
+export HOME=/tmp
+export XDG_CACHE_HOME=/tmp/.cache
+export CUPY_CACHE_DIR=/tmp/cupy-kernel-cache
+mkdir -p "\${XDG_CACHE_HOME}" "\${CUPY_CACHE_DIR}"
 python ${script} \
   --scheduler-address ${DASK_SCHEDULER_ADDRESS} \
   --output-dir ${result_dir} \
-  --iterations ${ITERATIONS} \
+  --warmup-runs ${WARMUP_RUNS} \
+  --repeats ${REPEATS} \
   --n-samples ${N_SAMPLES} \
-  --n-features ${N_FEATURES} \
   --n-clusters ${N_CLUSTERS} \
   --max-iter ${MAX_ITER} \
+  --tol ${TOL} \
   --seed ${SEED} \
-  --chunk-rows ${CHUNK_ROWS} \
+  --cluster-std ${CLUSTER_STD} \
+  --device-buffer-samples ${DEVICE_BUFFER_SAMPLES} \
   --expected-workers ${TOTAL_WORKERS} \
   --node-count ${NUM_NODES} \
   --gpus-per-node ${NUM_GPUS_PER_NODE} \
+  ${n_features_arg} \
+  ${input_fbin_arg} \
   ${samples_per_gpu_arg}
 " >> "${LOGS}/driver.log" 2>&1
 }
@@ -241,7 +273,7 @@ context.update(
     {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "engine": "cuml-dask-gpu",
-        "kind": "single-node" if int(os.environ["TOTAL_WORKERS"]) == 1 else "multi-node",
+        "kind": "single-node" if int(os.environ["NUM_NODES"]) == 1 else "multi-node",
         "worker_count": int(os.environ["TOTAL_WORKERS"]),
         "node_count": int(os.environ["NUM_NODES"]),
         "gpu_count": int(os.environ["TOTAL_WORKERS"]),

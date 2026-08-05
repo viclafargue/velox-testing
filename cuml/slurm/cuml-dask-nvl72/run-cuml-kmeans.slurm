@@ -20,8 +20,18 @@ if [[ -z "${N_SAMPLES:-}" ]]; then
   echo "Error: N_SAMPLES is required." >&2
   exit 1
 fi
+if [[ -z "${DEVICE_BUFFER_SAMPLES:-}" ]]; then
+  echo "Error: DEVICE_BUFFER_SAMPLES is required." >&2
+  exit 1
+fi
+if [[ -z "${REPEATS:-}" || -z "${WARMUP_RUNS:-}" ]]; then
+  echo "Error: REPEATS and WARMUP_RUNS are required." >&2
+  exit 1
+fi
 
-export VT_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." >/dev/null 2>&1 && pwd -P)"
+VT_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." >/dev/null 2>&1 && pwd -P)"
+export VT_ROOT
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/defaults.env"
 export IMAGE_DIR
 export DATASET_ROOT
@@ -55,6 +65,11 @@ echo "Coordinator IP: ${COORD_IP:-unknown}"
 echo "Worker image: ${WORKER_IMAGE}"
 echo "Total workers: ${TOTAL_WORKERS}"
 echo "Dataset rows: ${N_SAMPLES}"
+echo "Dataset source: $([[ -n "${INPUT_FBIN:-}" ]] && echo fbin || echo generated)"
+if [[ -n "${INPUT_FBIN:-}" ]]; then
+  echo "Input fbin: ${INPUT_FBIN}"
+fi
+echo "Device buffer samples: ${DEVICE_BUFFER_SAMPLES}"
 echo "Dask scheduler: ${DASK_SCHEDULER_ADDRESS}"
 echo "========================================"
 
